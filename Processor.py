@@ -8,7 +8,7 @@ classifier = pipeline("text-classification", model="bert-tiny-finetuned-sst2")
 
 
 class AudioProcessor:
-    def __init__(self, model_dir="/home/unitree/unitree_sdk2_python/example/go2/Speech_control/SenseVoiceSmall", vad_model="/home/unitree/unitree_sdk2_python/example/go2/Speech_control/fsmn_vad"):
+    def __init__(self, model_dir="******/SenseVoiceSmall", vad_model="******/fsmn_vad"):
         # 初始化耗时资源
         print("正在初始化处理资源...")
         self.model = AutoModel(
@@ -48,3 +48,4 @@ def judgementor(text):
     logging.getLogger("funasr.utils.cli_utils").disabled = True
 # 创建全局单例实例
 processor = AudioProcessor()
+
