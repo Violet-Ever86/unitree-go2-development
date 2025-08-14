@@ -21,7 +21,6 @@ version 1.0.1
 修复了“坐下”指令的调用错误
 增强了指令的处理逻辑，防止由于网络问题造成的指令堆积；
 将状态信息的返回内容改成英文表示
-version 1.0.2
 """
 
 logging.getLogger("funasr.utils.cli_utils").disabled = True
@@ -39,8 +38,8 @@ Gain_Factor = 2  # 增益系数
 os.makedirs(Save_Path, exist_ok=True)
 
 # 远程控制参数
-SERVER_IP = "47.111.140.142"
-SERVER_PORT = 9000
+SERVER_IP = "**********"
+SERVER_PORT = 000000
 tcp_socket = None
 running = True
 lock = threading.Lock()
