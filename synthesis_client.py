@@ -255,7 +255,6 @@ class Go2Monitor:
             }
         }
 
-
     def get_combined_info(self):
         """获取电池和温度的综合信息
 
@@ -403,6 +402,7 @@ class TCPClient:
 def speech2cmd(result, exec_flag):
     global validity, default_distance, default_speed, default_angle, is_wake
     is_wake = 0
+    
     def process_command(content, flag):
         global command_mode
         if "设置模式" in content:
@@ -419,6 +419,7 @@ def speech2cmd(result, exec_flag):
             if command_mode == "Planning":
                 flag = planning_execute(content, flag)
         return flag
+    
     for word in wake_up:
         if ''.join(lazy_pinyin(word)) in ''.join(lazy_pinyin(result)):
             is_wake = 1
@@ -453,7 +454,6 @@ def interact_execute(command, get_cmd):
             time.sleep(1)
         get_cmd = 1
         
-
     # 尝试匹配旋转指令（转）
     elif match := turn_pattern.search(command):
         print("left or right detected")
@@ -577,10 +577,10 @@ try:
     while True:
         battery_info = monitor.get_battery_info()
         tcp_client.send_state("state", 1001,
-                             {
-                                 "energy_remain": battery_info['soc'],
-                                 "mainboard_tempera": battery_info['mainboard'],
-                             })
+                              {
+                                  "energy_remain": battery_info['soc'],
+                                  "mainboard_tempera": battery_info['mainboard'],
+                              })
         time.sleep(state_freq)
 except KeyboardInterrupt:
     recorder.stop_listening()
