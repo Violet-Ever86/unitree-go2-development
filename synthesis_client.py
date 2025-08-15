@@ -1,8 +1,8 @@
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
+from Processor import processor, tts
 from pypinyin import lazy_pinyin
-from Processor import processor
 from collections import deque
 import sounddevice as sd
 import numpy as np
@@ -17,10 +17,12 @@ import os
 import re
 
 """
-version 1.0.1
-修复了“坐下”指令的调用错误
-增强了指令的处理逻辑，防止由于网络问题造成的指令堆积；
-将状态信息的返回内容改成英文表示
+version 1.0.2
+增加了一个简单的输入分流
+对于所有输入，首先进行控制指令的提取，同时将该内容与提示词一起传给指定的大模型
+在传给大模型的同时，在提示词中要求大模型对输入内容进行判断，如果需要进行回答，则额外输出flag=1，否则flag=0
+如果提取到了指令，就执行并忽略大模型的返回值；
+如果没有提取到指令，就等待大模型的回答，如果flag=1，就提取回答并生成语音，反之则忽略。
 """
 
 logging.getLogger("funasr.utils.cli_utils").disabled = True
@@ -38,8 +40,8 @@ Gain_Factor = 2  # 增益系数
 os.makedirs(Save_Path, exist_ok=True)
 
 # 远程控制参数
-SERVER_IP = "**********"
-SERVER_PORT = 000000
+SERVER_IP = "47.111.140.142"
+SERVER_PORT = 9000
 tcp_socket = None
 running = True
 lock = threading.Lock()
@@ -54,7 +56,7 @@ print("运动控制初始化完成！")
 
 #个性化参数
 wake_up = ["go to", "gou2", "go 2", "go two", "gou to", "goto"]  # 唤醒词
-is_wake = 0
+is_wake = 0  # 是否被唤醒，默认不启用
 command_mode = "Interactive"  # 控制模式：规划模式可以识别一连串指令；交互模式则只支持单句话
 validity = 6  # 被唤醒之后的几句话将可被识别
 is_sleeping = True  # 被唤醒一定时间后无指令将沉睡
@@ -156,13 +158,15 @@ class AudioRecorder:
                 # print(f"文件保存：{filename}")
 
             def async_process():
+                execution = 0
                 try:
                     result = processor.process(filename)
-                    speech2cmd(result)
-
+                    execution = speech2cmd(result, execution)
+                    if not execution:
+                        response = tcp_client.send2llm(result) # 目标大模型是流式传输，因此有多个回传
+                        tts(response)
                 except Exception as e:
                     print(f"{type(e).__name__} - {e}")
-                    pass
 
             threading.Thread(target=async_process).start()
 
@@ -194,6 +198,7 @@ class AudioRecorder:
                 self.stream.stop()
                 self.stream.close()
                 self.stream = None
+
 
 class Go2Monitor:
     def __init__(self, name):
@@ -366,7 +371,7 @@ class TCPClient:
         else:
             print(f"⚠️ 未知指令: {cmd}")
 
-    def send_json(self, data_type, data_id, content):
+    def send_state(self, data_type, data_id, content):
         with lock:
             if not self.connected:
                 print("⚠️ 未连接服务器，无法发送数据")
@@ -384,6 +389,9 @@ class TCPClient:
                 print(f"❌ 发送失败: {str(e)}")
                 self.connected = False
                 return False
+            
+    def send2llm(self, query):
+        return "test"
 
     def close(self):
         global running
@@ -392,36 +400,40 @@ class TCPClient:
             self.sock.close()
 
 
-def speech2cmd(result):
+def speech2cmd(result, exec_flag):
     global validity, default_distance, default_speed, default_angle, is_wake
     is_wake = 0
-    def process_command(content):
+    def process_command(content, flag):
         global command_mode
         if "设置模式" in content:
             if "计划模式" in content:
                 command_mode = "Planning"
                 print("mode set to Planing")
+                flag = 1
             elif "交互模式" in content:
                 command_mode = "Interactive"
-                print("mode set to interactive")
+                flag = 1
         else:
             if command_mode == "Interactive":
-                interact_execute(content)
+                flag = interact_execute(content, flag)
             if command_mode == "Planning":
-                planning_execute(content)
+                flag = planning_execute(content, flag)
+        return flag
     for word in wake_up:
         if ''.join(lazy_pinyin(word)) in ''.join(lazy_pinyin(result)):
             is_wake = 1
             print("detect wake-up word")
             validity = 6
-            process_command(result)
+            exec_flag = process_command(result, exec_flag)
             break
     if not is_wake and validity:
         print(f"validity remain {validity} times")
         validity -= 1
-        process_command(result)
+        exec_flag = process_command(result, exec_flag)
+    return exec_flag
 
-def interact_execute(command):
+def interact_execute(command, get_cmd):
+    global execution
     print(f"interactive mode: {command}")
     global default_distance, default_speed
     move_pattern = re.compile(r'([前后])走?(\d+|[零一二三四五六七八九十百]+)?米?')
@@ -439,6 +451,8 @@ def interact_execute(command):
         for i in range(step):
             sport_client.Move(direction, 0, 0)
             time.sleep(1)
+        get_cmd = 1
+        
 
     # 尝试匹配旋转指令（转）
     elif match := turn_pattern.search(command):
@@ -456,13 +470,16 @@ def interact_execute(command):
         for i in range(distance):
             sport_client.Move(0, 0, direction * angle / 180 * 3.14)
             time.sleep(1)
+        get_cmd = 1
 
     elif "站起" in command:
         sport_client.StandUp()
         time.sleep(0.5)
         sport_client.BalanceStand()
+        get_cmd = 1
     elif "坐下" in command:
         sport_client.StandDown()
+        get_cmd = 1
     elif match := setting_pattern.search(command):
         action, target = match.group(1), match.group(2)
         if target == "速度" and 0 <= default_speed <= 2:
@@ -471,17 +488,21 @@ def interact_execute(command):
             sport_client.SwitchGait(1)
             time.sleep(1)
             sport_client.SwitchGait(0)
+            get_cmd = 1
         if target == "距离" and 1 <= default_distance <= 5:
             default_distance += 1 if action in ["上调", "增大"] else -1
 
             sport_client.SwitchGait(1)
             time.sleep(1)
             sport_client.SwitchGait(0)
+            get_cmd = 1
     else:
+        get_cmd = 0
         print("interactive mode: no matched results")
+    return get_cmd
 
-def planning_execute(text):
-    global default_distance, default_speed
+def planning_execute(text, get_cmd):
+    global default_distance, default_speed, execution
     move_pattern = re.compile(r'([前后])走?(\d+|[零一二三四五六七八九十百]+)?米?')
     turn_pattern = re.compile(r'([左右])转?(\d+|[零一二三四五六七八九十百]+)?度?')
 
@@ -500,6 +521,7 @@ def planning_execute(text):
             for i in range(step):
                 sport_client.Move(direction, 0, 0)
                 time.sleep(1)
+            get_cmd = 1
 
         # 尝试匹配旋转指令（转）
         elif match := turn_pattern.search(command):
@@ -517,6 +539,8 @@ def planning_execute(text):
             for i in range(distance):
                 sport_client.Move(0, 0, direction * angle / 180 * 3.14)
                 time.sleep(1)
+            get_cmd = 1
+    return get_cmd
 
 def split_command(text):
     result = []
@@ -552,7 +576,7 @@ monitor = Go2Monitor("eth0")
 try:
     while True:
         battery_info = monitor.get_battery_info()
-        tcp_client.send_json("state", 1001,
+        tcp_client.send_state("state", 1001,
                              {
                                  "energy_remain": battery_info['soc'],
                                  "mainboard_tempera": battery_info['mainboard'],
