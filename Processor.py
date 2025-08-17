@@ -1,11 +1,16 @@
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.go2.sport.sport_client import SportClient
+from kokoro import KPipeline, KModel
 from pypinyin import lazy_pinyin
+from playsound import playsound
 from funasr import AutoModel
+import soundfile as sf
 import cn2an
+import torch
 import time
 import re
+import os
 
 # 初始化运动控制及低层状态监控
 ChannelFactoryInitialize(0, "eth0")
@@ -16,6 +21,8 @@ state_freq = 10
 print("运动控制初始化完成！")
 
 #个性化参数
+stt_recog_model_path = "**/SenseVoiceSmall"
+stt_vad_model_path = "***/fsmn_vad"
 wake_up = ["go to", "gou2", "go 2", "go two", "gou to", "goto"]  # 唤醒词
 is_wake = 0  # 是否被唤醒，默认不启用
 command_mode = "Interactive"  # 控制模式：规划模式可以识别一连串指令；交互模式则只支持单句话
@@ -27,10 +34,40 @@ default_distance = 1
 default_angle = 45
 
 
+# 加载模型和管道（全局只加载一次）
+tts_model = 'hexgrad/Kokoro-82M-v1.1-zh'
+tts_model_path = 'ckpts/kokoro-v1.1/kokoro-v1_1-zh.pth'
+tts_config_path = 'ckpts/kokoro-v1.1/config.json'
+tts_timbre_path = "ckpts/kokoro-v1.1/voices/zm_014.pt"
+
+
+class Kokoro:
+    def __init__(self, repo_id, model_path, config_path, timbre):
+        print("正在初始化语音生成模型...")
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model = KModel(model=model_path, config=config_path, repo_id=repo_id).to(device).eval()
+        self.zh_pipeline = KPipeline(lang_code='z', repo_id=repo_id, model=self.model)
+        self.timbre_tensor = torch.load(timbre, weights_only=True)
+        print("语音模型初始化完成！")
+    
+    def generate(self, text, output_path):
+        # 生成语音
+        self.generator = self.zh_pipeline(text, voice=self.timbre_tensor, speed=1.1)
+        result = next(self.generator)
+        wav = result.audio
+        # 保存文件
+        sf.write(output_path, wav, 24000)
+    
+    def play_audio(self, audio_path):
+        abs_path = os.path.abspath(audio_path)
+        # 使用异步播放避免阻塞问题
+        playsound(abs_path, block=True)
+        
+
 class AudioProcessor:
-    def __init__(self, model_dir="/home/unitree/unitree_sdk2_python/example/go2/Speech_control/SenseVoiceSmall", vad_model="/home/unitree/unitree_sdk2_python/example/go2/Speech_control/fsmn_vad"):
+    def __init__(self, model_dir, vad_model):
         # 初始化耗时资源
-        print("正在初始化处理资源...")
+        print("正在初始化语音识别模型...")
         self.model = AutoModel(
             model=model_dir,
             vad_model=vad_model,  # 将长语音切割成短句
@@ -42,7 +79,7 @@ class AudioProcessor:
             disable_pbar=True,
             log_level='ERROR'
         )
-        print("资源初始化完成！")
+        print("语音识别模型初始化完成！")
 
     def process(self, file_path):
         # 使用已初始化的资源处理文件
@@ -60,6 +97,7 @@ class AudioProcessor:
         return result
 
 
+# 指令控制处理函数
 def speech2cmd(result, exec_flag):
     global validity, default_distance, default_speed, default_angle, is_wake
     is_wake = 0
@@ -225,7 +263,7 @@ def split_command(text):
     
     return result
 
-def tts(text):
-    pass
+
 # 创建全局单例实例
-processor = AudioProcessor()
+tts_generator = Kokoro(tts_model, tts_model_path, tts_config_path, tts_timbre_path)
+stt_processor = AudioProcessor(stt_recog_model_path, stt_vad_model_path)
