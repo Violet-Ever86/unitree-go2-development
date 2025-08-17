@@ -1,16 +1,18 @@
-from Processor import processor, tts, speech2cmd, sport_client
+from Processor import stt_processor, tts_generator, speech2cmd, sport_client
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from collections import deque
 import sounddevice as sd
 import numpy as np
 import threading
+import requests
 import logging
 import socket
 import wave
 import time
 import json
 import os
+import re
 
 
 """
@@ -32,17 +34,22 @@ Low_Threshold = 15  # 监测响应音量
 High_Threshold = 20  # 开始录音音量
 PreRecord = 1  # 预录音时长/s
 SilenceCut = 1  # 结束录音检测时长
-Save_Path = "recordings"
 Gain_Factor = 2  # 增益系数
+Save_Path = "recordings"
 os.makedirs(Save_Path, exist_ok=True)
+os.makedirs('voices', exist_ok=True)
 
-# 远程控制参数
+# 远程控制及服务器交互参数
+equip_id = "1001"
 SERVER_IP = "47.111.140.142"
 SERVER_PORT = 9000
-tcp_socket = None
 running = True
 state_freq = 10
 lock = threading.Lock()
+
+# 大模型通信参数
+llm_url_root = "****"
+llm_chat_route = "/ChatMessages"
 
 
 class AudioRecorder:
@@ -135,15 +142,22 @@ class AudioRecorder:
                 for chunk in truncated:
                     f.writeframes(chunk.tobytes())
                 # print(f"文件保存：{filename}")
-
+            
             def async_process():
                 execution = 0
                 try:
-                    result = processor.process(filename)
+                    result = stt_processor.process(filename)
                     execution = speech2cmd(result, execution)
+                    
                     if not execution:
-                        response = tcp_client.send2llm(result) # 目标大模型是流式传输，因此有多个回传
-                        tts(response)
+                        tts_path = os.path.join("voices", f"{str(time.time())}.wav")
+                        
+                        # 使用LLMClient处理请求
+                        response = llm_client.query(result)  # 直接获取完整响应
+                        
+                        # 生成语音
+                        tts_generator.generate(response, tts_path)
+                        tts_generator.play_audio(tts_path)
                 except Exception as e:
                     print(f"{type(e).__name__} - {e}")
 
@@ -180,17 +194,15 @@ class AudioRecorder:
 
 
 class Go2Monitor:
-    def __init__(self, name):
-        """初始化机器狗监控模块
-        Args:
-            ether_name: 网络接口名称 (可选)
-        """
+    def __init__(self, id):
         self.low_state = None
 
         # 创建状态订阅器
         self.sub = ChannelSubscriber("rt/lowstate", LowState_)
         self.sub.Init(self._state_handler, 10)
-
+        
+        self.id = id
+        
         # 等待初始数据
         time.sleep(0.5)
 
@@ -200,7 +212,6 @@ class Go2Monitor:
 
     def get_battery_info(self):
         """获取电池信息
-
         Returns:
             dict: 包含电池信息的字典，结构如下:
             {
@@ -232,17 +243,6 @@ class Go2Monitor:
                 'mcu_res': bms.mcu_ntc[0],
                 'mcu_mos': bms.mcu_ntc[1]
             }
-        }
-
-    def get_combined_info(self):
-        """获取电池和温度的综合信息
-
-        Returns:
-            dict: 包含所有监控信息的字典
-        """
-        return {
-            'battery': self.get_battery_info(),
-            'temperature': self.get_temperature_info()
         }
 
 
@@ -367,9 +367,6 @@ class TCPClient:
                 print(f"❌ 发送失败: {str(e)}")
                 self.connected = False
                 return False
-            
-    def send2llm(self, query):
-        return "test"
 
     def close(self):
         global running
@@ -377,6 +374,166 @@ class TCPClient:
         if self.sock:
             self.sock.close()
 
+
+class LLMClient:
+    def __init__(self, base_url=llm_url_root, timeout=10): # timeout暂时存疑
+        self.base_url = base_url
+        self.timeout = timeout
+        self.session = requests.Session()
+    
+    def clean_response(self, text):
+        """清理特殊符号并提取有效内容"""
+        if not text:
+            return ""
+        
+        # 移除Markdown符号
+        text = re.sub(r'[#*_`~]', '', text)
+        # 移除HTML标签
+        text = re.sub(r'<.*?>', '', text)
+        # 合并多余空格和换行
+        text = re.sub(r'\s+', ' ', text)
+        # 处理特殊转义序列
+        text = text.replace('\\n', '\n').replace('\\t', '\t')
+        # 移除JSON元数据标记
+        text = re.sub(r'\{.*?\}', '', text)
+        return text.strip()
+    
+    def stream_query(self, query, chat_url=llm_chat_route):
+        """处理流式响应，提取answer字段"""
+        url = self.base_url + chat_url
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "query": query,
+            "ResponseMode": "streaming",
+            "UserId": monitor.id,
+            "ProjectId": "string",
+            "limit": "string"
+        }
+        
+        full_response = ""
+        answer_complete = False
+        metadata_detected = False
+        
+        try:
+            # 使用流式接收
+            with self.session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    stream=True,
+                    timeout=self.timeout
+            ) as response:
+                
+                if response.status_code != 200:
+                    print(f"LLM请求失败: HTTP {response.status_code}")
+                    return "服务暂时不可用，请稍后再试"
+                
+                # 逐行处理流式响应
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    
+                    try:
+                        # 解码JSON
+                        chunk = json.loads(line.decode('utf-8'))
+                        
+                        # 检查是否包含answer字段
+                        if "answer" in chunk and not metadata_detected:
+                            # 提取并清理内容
+                            cleaned = self.clean_response(chunk["answer"])
+                            full_response += cleaned
+                            
+                            # 检查answer是否完整
+                            if cleaned.endswith(('.', '?', '!', '。', '？', '！')):
+                                answer_complete = True
+                        
+                        # 检查metadata标记
+                        if "metadata" in chunk:
+                            metadata_detected = True
+                        
+                        # 如果检测到元数据或answer已完成，停止处理
+                        if metadata_detected or answer_complete:
+                            break
+                    
+                    except json.JSONDecodeError:
+                        # 尝试提取可能的文本内容
+                        line_str = line.decode('utf-8', errors='ignore')
+                        if '"answer":' in line_str:
+                            # 尝试手动提取answer内容
+                            match = re.search(r'"answer":\s*"([^"]+)"', line_str)
+                            if match:
+                                cleaned = self.clean_response(match.group(1))
+                                full_response += cleaned
+                    
+                    except Exception as e:
+                        print(f"处理响应行时出错: {str(e)}")
+        
+        except requests.exceptions.Timeout:
+            print("LLM请求超时")
+            if not full_response:
+                return "请求超时，请稍后再试"
+        
+        except Exception as e:
+            print(f"未知错误: {str(e)}")
+            if not full_response:
+                return "处理请求时出错"
+        
+        return full_response
+    
+    def query(self, query, chat_url=llm_chat_route):
+        """发送查询并获取响应"""
+        url = self.base_url + chat_url
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "query": query,
+            "ResponseMode": "streaming",
+            "UserId": monitor.id,
+            "ProjectId": "string",
+            "limit": "string"
+        }
+        
+        try:
+            # 发送普通POST请求
+            response = self.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout
+            )
+            
+            # 检查响应状态
+            if response.status_code != 200:
+                print(f"LLM请求失败: HTTP {response.status_code}")
+                return "服务暂时不可用，请稍后再试"
+            
+            # 解析JSON响应
+            response_data = response.json()
+            
+            # 提取answer内容
+            if "data" in response_data and isinstance(response_data["data"], dict):
+                data = response_data["data"]
+                if "answer" in data:
+                    answer = data["answer"]
+                    # 清理内容
+                    cleaned_answer = self.clean_response(answer)
+                    return cleaned_answer
+            
+            # 如果找不到预期结构，尝试直接提取answer
+            if "answer" in response_data:
+                answer = response_data["answer"]
+                return self.clean_response(answer)
+            
+            # 如果都没有，返回错误信息
+            print(f"响应中缺少answer字段: {response_data}")
+            return "响应中缺少有效内容"
+        
+        except requests.exceptions.Timeout:
+            print("LLM请求超时")
+            return "请求超时，请稍后再试"
+        
+        except Exception as e:
+            print(f"未知错误: {str(e)}")
+            return "处理请求时出错"
 
 # 初始化网络控制
 tcp_client = TCPClient(sport_client)
@@ -387,13 +544,16 @@ recorder.start_listening()
 tcp_thread = threading.Thread(target=tcp_client.receive_commands, daemon=True)
 tcp_thread.start()
 
+# 初始化大模型请求处理
+llm_client = LLMClient()
+
 # 初始化状态监控
-monitor = Go2Monitor("eth0")
+monitor = Go2Monitor(equip_id)
 
 try:
     while True:
         battery_info = monitor.get_battery_info()
-        tcp_client.send_state("state", 1001,
+        tcp_client.send_state("state", monitor.id,
                               {
                                   "energy_remain": battery_info['soc'],
                                   "mainboard_tempera": battery_info['mainboard'],
